@@ -3,7 +3,7 @@ name: Auto Renew HidenCloud
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 23 * * 0' # 根据到期时间的前一天推算星期几来续期，最后一个数字代表星期
+        - cron: '30 23 */6 * *' # 每6天跑一次；6天 < 7天续期周期，每次运行都能落在续期窗口内
 
 permissions:
   contents: write
