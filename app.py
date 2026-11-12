@@ -4,31 +4,45 @@
 import os,re,sys,time,random,requests
 try:
     from patchright.sync_api import sync_playwright
+    USING_PATCHRIGHT = True
 except ImportError:
     from playwright.sync_api import sync_playwright
+    USING_PATCHRIGHT = False
 
-# --- 环境变量 ---
+# --- 环境变量 (可在Settings里设置secrets或者私库直接填写在双引号里)---
 COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # remember_web cookie 值，必填
-EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，作为备用,TG通知需要填写
-PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用
-TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
-TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选
+EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，作为备用, 必填
+PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用, 必填
+TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选，通知
+TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选 
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
 
 # --- 代理配置（由工作流 shell 脚本写入 $GITHUB_ENV）---
 IS_PROXY      = os.environ.get('IS_PROXY', 'false').lower() == 'true'
-PROXY_SERVER  = os.environ.get('PROXY_SERVER') or "socks5://127.0.0.1:1080"
+PROXY_SERVER  = os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081"
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
+
+# Cloudflare 整页挑战 / Turnstile 组件共用的 iframe 选择器
+CF_IFRAME_SELECTOR = 'iframe[src*="challenges.cloudflare.com"]'
+
+# 按运行平台选择 UA
+if sys.platform == 'win32':
+    DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+else:
+    DEFAULT_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
 
 # 日志
 def log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-window.chrome = { runtime: {} };
+// 注意：使用真实 Chrome（channel="chrome"）时不要覆盖 window.chrome，
+// 否则会丢失 app/csi/loadTimes 等真实特征，反而更容易被 Cloudflare 识别。
+try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+} catch (e) {}
 """
 
 def get_current_ip(proxy_server=None):
@@ -44,7 +58,7 @@ def get_current_ip(proxy_server=None):
         log(f"❌ 获取出口IP失败: {e}")
         return "获取失败"
 
-def send_telegram_notification(status, old_due, new_due):
+def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
     """发送 Telegram 通知"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("⚠️ Telegram 未配置，跳过通知")
@@ -60,7 +74,7 @@ def send_telegram_notification(status, old_due, new_due):
         else:
             masked_email = f"{name}@{domain}"
     else:
-        masked_email = EMAIL[:2] + '****' 
+        masked_email = EMAIL[:2] + '****'
 
     text = (
         f"🎉 HidenCloud 续期通知\n\n"
@@ -68,6 +82,7 @@ def send_telegram_notification(status, old_due, new_due):
         f"👤 账号: {masked_email}\n"
         f"📅 续期前到期：{old_due}\n"
         f"📅 续期后到期：{new_due}\n"
+        f"🌐 续期使用IP: {current_ip}\n"
         f"🕒 续期时间：{now}"
     )
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -88,31 +103,447 @@ def send_telegram_notification(status, old_due, new_due):
         log(f"❌ Telegram 通知异常: {e}")
         return False
 
-def handle_cloudflare(page):
-    iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
-    if page.locator(iframe_selector).count() == 0:
-        return True
-    log("⚠️ 检测到 Cloudflare 验证...")
-    start_time = time.time()
-    while time.time() - start_time < 60:
-        if page.locator(iframe_selector).count() == 0:
-            log("✅ Cloudflare 验证通过！")
-            return True
+def _get_turnstile_token(page):
+    """读取 Turnstile 验证通过后生成的响应 token，未通过时返回 None"""
+    try:
+        return page.evaluate(
+            """
+            () => {
+                try {
+                    if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                        let t = null;
+                        try { t = window.turnstile.getResponse(); } catch (e) {}
+                        if (t && t.length > 30) return t;
+                        for (let i = 0; i < 5; i++) {
+                            try { t = window.turnstile.getResponse(String(i)); } catch (e) { t = null; }
+                            if (t && t.length > 30) return t;
+                        }
+                    }
+                } catch (e) {}
+                const inputs = document.querySelectorAll(
+                    'input[name="cf-turnstile-response"], input[id$="_response"]'
+                );
+                for (const el of inputs) {
+                    if (el.value && el.value.length > 30) return el.value;
+                }
+                return null;
+            }
+            """
+        )
+    except Exception:
+        return None
+
+def _find_visible_cf_frames(page):
+    """返回当前可见且有实际尺寸的 Cloudflare 挑战/Turnstile iframe（后出现的排最后，弹窗内的通常在最后）"""
+    result = []
+    try:
+        for handle in page.query_selector_all(CF_IFRAME_SELECTOR):
+            try:
+                box = handle.bounding_box()
+                if box and box['width'] > 10 and box['height'] > 10:
+                    result.append(handle)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return result
+
+def _cf_checkbox_visible(page):
+    """任意 Cloudflare 框架内（含嵌套 iframe）当前是否可见复选框"""
+    for frame in page.frames:
+        if 'challenges.cloudflare.com' not in (frame.url or ''):
+            continue
         try:
-            frame = page.frame_locator(iframe_selector)
-            checkbox = frame.locator('input[type="checkbox"]')
-            if checkbox.is_visible():
-                log("🖱️ 点击验证复选框...")
-                time.sleep(random.uniform(0.5, 1.5))
-                checkbox.click()
-                log("⏳ 已点击，等待验证结果...")
-                time.sleep(5)
-            else:
-                time.sleep(1)
+            if frame.locator('input[type="checkbox"]:visible').count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+def _click_cf_checkbox(page, frame_el=None):
+    """点击 Cloudflare/Turnstile 复选框：先试框架内元素（含嵌套 iframe），失败退化为坐标点击"""
+    for frame in page.frames:
+        if 'challenges.cloudflare.com' not in (frame.url or ''):
+            continue
+        try:
+            frame.locator('input[type="checkbox"]').first.click(timeout=2500)
+            return True
+        except Exception:
+            continue
+    # 退化方案：复选框通常位于 iframe 左侧（x≈20~35，垂直居中），用真实鼠标事件点击
+    if frame_el is None:
+        return False
+    try:
+        try:
+            frame_el.scroll_into_view_if_needed(timeout=3000)
         except Exception:
             pass
-    log("❌ 验证超时。")
+        box = frame_el.bounding_box()
+        if not box:
+            return False
+        x = box['x'] + random.uniform(18, 34)
+        y = box['y'] + box['height'] / 2 + random.uniform(-4, 4)
+        page.mouse.move(x - random.uniform(30, 60), y + random.uniform(-8, 8))
+        time.sleep(random.uniform(0.15, 0.4))
+        page.mouse.move(x, y)
+        time.sleep(random.uniform(0.05, 0.2))
+        page.mouse.down()
+        time.sleep(random.uniform(0.04, 0.1))
+        page.mouse.up()
+        return True
+    except Exception:
+        return False
+
+SECURITY_TITLE_HINTS = ('security verification', 'just a moment', 'attention required', 'checking your browser', '请稍候', 'please wait', 'one more step')
+
+def _is_security_check_page(page):
+    try:
+        title = (page.title() or '').lower()
+        if any(h in title for h in SECURITY_TITLE_HINTS):
+            return True
+    except Exception:
+        return True
+    try:
+        return page.evaluate(
+            """
+            () => {
+                const t = document.body ? document.body.innerText.slice(0, 5000).toLowerCase() : '';
+                return t.includes('verify you are human') || t.includes('checking your browser')
+                    || t.includes('security verification');
+            }
+            """
+        )
+    except Exception:
+        return True
+
+def _has_interstitial_iframe(page):
+    """是否存在整页挑战 iframe（排除弹窗内 /turnstile/ 组件 iframe，那由 solve_modal_turnstile 处理）"""
+    try:
+        for handle in page.query_selector_all(CF_IFRAME_SELECTOR):
+            if '/turnstile/' not in (handle.get_attribute('src') or ''):
+                return True
+    except Exception:
+        pass
     return False
+
+def _click_security_submit(page):
+    """安全验证页 token 已生成但仍停在验证页时，尝试点击确认/继续按钮"""
+    for text in ('Verify', 'Continue', 'Submit', 'Proceed', '验证'):
+        try:
+            btn = page.locator(f'button:has-text("{text}"):visible, input[type="submit"]:visible').first
+            if btn.count() > 0:
+                btn.click(timeout=3000)
+                log(f"🖱️ 已点击安全验证页的确认按钮（{text}）...")
+                return True
+        except Exception:
+            continue
+    return False
+
+def _dump_security_page(page):
+    """调试：采集安全验证页的关键结构（iframe/按钮/正文），便于排查"""
+    try:
+        page.screenshot(path="security_page.png")
+        srcs = page.evaluate(
+            "() => Array.from(document.querySelectorAll('iframe')).map(f => f.src).filter(Boolean)"
+        )
+
+        buttons = page.evaluate(
+            "() => Array.from(document.querySelectorAll('button, input[type=submit], a.btn')).map(b => (b.innerText || b.value || '').trim()).filter(t => t && t.length < 40)"
+        )
+        # log(f"🔍 验证页按钮: {buttons}")
+        body = page.evaluate("() => document.body ? document.body.innerText.slice(0, 200) : ''")
+        # log(f"🔍 验证页正文: {body}")
+    except Exception as e:
+        log(f"🔍 验证页信息采集失败: {e}")
+
+def handle_cloudflare(page, timeout=240):
+    def challenge_active():
+        return _has_interstitial_iframe(page) or _is_security_check_page(page)
+
+    if not challenge_active():
+        for _ in range(3):
+            time.sleep(1)
+            if challenge_active():
+                break
+        else:
+            return True
+
+    log("🔒 检测到 Cloudflare 安全验证...")
+    time.sleep(5)
+    _dump_security_page(page)
+
+    effective_timeout = timeout + (180 if timeout > 60 else 0)
+    manual_hinted = False
+    start_time = time.time()
+    last_click = 0
+    clear_rounds = 0
+    while time.time() - start_time < effective_timeout:
+        if not challenge_active():
+            clear_rounds += 1
+            if clear_rounds >= 2: 
+                # log("✅ Turnstile 安全验证通过！")
+                return True
+            time.sleep(1)
+            continue
+        clear_rounds = 0
+        if not manual_hinted and timeout > 60 and time.time() - start_time > timeout - 30:
+            log("🤝 自动点击未能通过验证，脚本会继续等待...")
+            manual_hinted = True
+        if time.time() - last_click > 6:
+            frames = _find_visible_cf_frames(page)
+            if frames:
+                log("🖱️ 点击 Turnstile 验证......")
+                if _click_cf_checkbox(page, frames[-1]):
+                    last_click = time.time()
+                    time.sleep(random.uniform(3, 5))
+                    continue
+            elif _get_turnstile_token(page) and _is_security_check_page(page):
+                # token 已生成但页面仍停在验证页：可能需要手动点确认按钮
+                if _click_security_submit(page):
+                    last_click = time.time()
+                    time.sleep(random.uniform(2, 4))
+                    continue
+        time.sleep(1)
+    log("❌ 验证超时。")
+    try:
+        page.screenshot(path="security_timeout.png")
+    except Exception:
+        pass
+    return False
+
+def solve_modal_turnstile(page, timeout=90):
+    log("🛡️ 开始处理 Turnstile 验证...")
+    start = time.time()
+    last_click = 0
+    clicks = 0
+    no_frame_seconds = 0
+    while time.time() - start < timeout:
+        # 1) token 已生成 → 验证通过
+        if _get_turnstile_token(page):
+            log("✅ Turnstile 验证通过！")
+            return True
+        frames = _find_visible_cf_frames(page)
+        if not frames:
+            # 弹窗里还没有 Turnstile（可能没加载出来），等 20 秒后视为无需验证
+            no_frame_seconds += 1
+            if no_frame_seconds >= 20 and clicks == 0:
+                log("ℹ️ 未检测到 Turnstile 验证框，无需验证。")
+                return True
+            time.sleep(1)
+            continue
+        no_frame_seconds = 0
+        # 2) 已点击过且框内复选框消失（变成对勾）→ 视为通过（token 字段名可能被站点自定义时兜底）
+        if clicks > 0 and time.time() - last_click > 4 and not _cf_checkbox_visible(page):
+            time.sleep(2)
+            if not _cf_checkbox_visible(page):
+                log("✅ Turnstile 复选框已消失，视为验证通过！")
+                return True
+        # 3) 存在可见验证框时，每隔几秒重试点击
+        if time.time() - last_click > 6 and _cf_checkbox_visible(page):
+            log(f"🖱️ 点击 Turnstile 复选框（第 {clicks + 1} 次）...")
+            if _click_cf_checkbox(page, frames[-1]):
+                clicks += 1
+                last_click = time.time()
+                time.sleep(random.uniform(3, 5))
+                continue
+        # 4) 长时间检测不到可点击的复选框时，直接坐标点击兜底
+        if clicks == 0 and time.time() - start > 20 and time.time() - last_click > 6:
+            if _click_cf_checkbox(page, frames[-1]):
+                clicks += 1
+                last_click = time.time()
+                time.sleep(random.uniform(3, 5))
+                continue
+        time.sleep(1)
+    if _get_turnstile_token(page):
+        log("✅ Turnstile 验证通过！")
+        return True
+    log("❌ Turnstile 验证超时。")
+    return False
+
+def open_browser(p):
+    """启动浏览器，返回 (browser, page)。优先 patchright（反检测内核），未安装则退回原生 playwright。"""
+    proxy_arg = {"server": PROXY_SERVER} if IS_PROXY else None
+    if USING_PATCHRIGHT:
+        browser = p.chromium.launch(
+            channel="chrome",
+            headless=False,
+            args=['--disable-infobars'],
+            proxy=proxy_arg,
+        )
+        ctx = browser.new_context(viewport=None, proxy=proxy_arg)
+        page = ctx.new_page()
+        return browser, page
+    log("⚠️ 未安装 patchright（建议 pip install patchright），退回原生 playwright，过 Cloudflare 能力较弱")
+    browser = p.chromium.launch(
+        channel="chrome",
+        headless=False,
+        args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
+    )
+    ctx = browser.new_context(
+        viewport={'width': 1920, 'height': 1080},
+        user_agent=DEFAULT_UA,
+        proxy=proxy_arg,
+    )
+    page = ctx.new_page()
+    page.add_init_script(STEALTH_JS)
+    return browser, page
+
+def _is_logged_in(page):
+    """是否真正处于登录后的控制台状态（防止把官网首页/验证页/登录页误判为登录成功）"""
+    try:
+        url = page.url or ''
+        if 'dash.hidencloud.com' not in url:
+            return False
+        if 'auth/login' in url or _is_security_check_page(page):
+            return False
+        return True
+    except Exception:
+        return False
+
+def login(page):
+    # 1. Cookie 登录尝试
+    if COOKIE_VALUE:
+        log("📇 尝试 Cookie 登录...")
+        try:
+            page.context.add_cookies([{
+                'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
+                'value': COOKIE_VALUE,
+                'domain': 'dash.hidencloud.com',
+                'path': '/',
+                'expires': int(time.time()) + 3600 * 24 * 365,
+                'httpOnly': True,
+                'secure': True,
+                'sameSite': 'Lax'
+            }])
+            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+            handle_cloudflare(page, timeout=240)
+            time.sleep(2)
+            handle_cloudflare(page, timeout=60)  # 跳转后可能再次出现验证页
+            if _is_logged_in(page):
+                log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
+                return True
+            log("❌ Cookie 失效，请更换")
+        except Exception as e:
+            log(f"⚠️ Cookie 登录尝试异常: {e}")
+
+    # 2. 账号密码登录
+    if not EMAIL or not PASSWORD:
+        return False
+    log("💣 尝试账号密码登录...")
+    try:
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page, timeout=240)
+        time.sleep(2)
+        
+        log("⌨️ 输入账号密码...")
+        # 真实表单字段：input[name="username"]（可填邮箱或用户名）/ input[name="password"]
+        user_input = page.locator('input[name="username"], input[name="email"], input[type="email"]').first
+        pwd_input = page.locator('input[name="password"], input[type="password"]').first
+        try:
+            # 登录表单要等安全验证页通过后才会渲染
+            user_input.wait_for(state="visible", timeout=30000)
+        except Exception:
+            handle_cloudflare(page, timeout=120)
+            user_input.wait_for(state="visible", timeout=30000)
+        user_input.fill(EMAIL, timeout=10000)
+        pwd_input.fill(PASSWORD, timeout=10000)
+        time.sleep(0.5)
+        handle_cloudflare(page, timeout=60)
+
+        # 登录表单自带 Turnstile，提交前先等它的 token
+        if not solve_modal_turnstile(page, timeout=90):
+            log("⚠️ 登录表单的 Turnstile 未确认通过，仍将尝试提交...")
+        
+        log("🖱️ 点击登录按钮提交...")
+        try:
+            page.click('button[type="submit"]', timeout=8000)
+        except Exception:
+            page.locator('button:has-text("Sign in"), button:has-text("登录")').first.click(timeout=10000)
+        time.sleep(3)
+        handle_cloudflare(page, timeout=240)
+        nav_start = time.time()
+        navigated = False
+        while time.time() - nav_start < 120:
+            try:
+                if "/auth/login" not in page.url and not _is_security_check_page(page):
+                    navigated = True
+                    break
+                if _is_security_check_page(page) or _has_interstitial_iframe(page):
+                    handle_cloudflare(page, timeout=60)
+            except Exception:
+                pass
+            time.sleep(1)
+        if not navigated:
+            log("❌ 登录提交后未能完成跳转。")
+            page.screenshot(path="login_fail.png")
+            return False
+        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page, timeout=120)
+        page_title = page.title()
+        log(f"📝 当前Title: {page_title}")
+        if not _is_logged_in(page):
+            log("❌ 登录失败。")
+            return False
+        log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
+        return True
+    except Exception as e:
+        log(f"❌ 登录异常: {e}")
+        page.screenshot(path="login_fail.png")
+        return False
+
+def get_server_id(page):
+    try:
+        if 'dash.hidencloud.com' not in page.url:
+            log("⚠️ 当前不在控制台页面，先跳转 dashboard...")
+            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+            handle_cloudflare(page)
+            time.sleep(2)
+        handle_cloudflare(page)
+        time.sleep(3)
+        html = page.content()
+        log(f"📝 页面长度: {len(html)}, URL: {page.url}")
+
+        # 方案1: 从 href 链接中提取 /service/数字/manage
+        matches = re.findall(r'/service/(\d+)/manage', html)
+        if matches:
+            server_id = matches[0]
+            log(f"✅ 从链接中获取到 Server ID: {server_id}")
+            return server_id
+
+        # 方案2: 从 span 标签中提取 #数字 (如 "Free Server #218079")；过滤全 0 的误匹配
+        matches = [m for m in re.findall(r'#(\d{4,})', html) if set(m) != {'0'}]
+        if matches:
+            server_id = matches[0]
+            log(f"✅ 从文本 #号中获取到 Server ID: {server_id}")
+            return server_id
+
+        log("❌ 所有 URL 均未找到 Server ID")
+        return None
+    except Exception as e:
+        log(f"❌ 获取 Server ID 失败: {e}")
+        page.screenshot(path="server_id_error.png")
+        return None
+
+def get_due_date(page):
+    try:
+        if SERVICE_URL not in page.url:
+            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page)
+        body_text = page.locator("body").inner_text()
+        patterns = [
+            r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+            r"Due date\s*\n\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+            r"Due date.*?(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, body_text, re.IGNORECASE | re.DOTALL)
+            if match:
+                due_date = match.group(1).strip()
+                log(f"📅 获取到Due Date: {due_date}")
+                return due_date
+    except Exception as e:
+        log(f"❌ 获取Due Date失败: {e}")
+    return "未知"
 
 def dismiss_ncmp_banner(page):
     """关掉 ncmp Cookie 横幅（.ncmp__banner-inner）。
@@ -156,134 +587,6 @@ def dismiss_ncmp_banner(page):
         log(f"⚠️ 关闭 ncmp 横幅失败（继续尝试点击）: {e}")
         return False
 
-def login(page):
-    # 1. Cookie 登录尝试
-    if COOKIE_VALUE:
-        # 处理从 DevTools 复制时可能带有的 URL 编码（如末尾 %3D）
-        import urllib.parse
-        _cookie_val = urllib.parse.unquote(COOKIE_VALUE.strip())
-        log("📇 尝试 Cookie 登录...")
-        try:
-            page.context.add_cookies([{
-                'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
-                'value': _cookie_val,
-                'domain': 'dash.hidencloud.com',
-                'path': '/',
-                'expires': int(time.time()) + 3600 * 24 * 365,
-                'httpOnly': True,
-                'secure': True,
-                'sameSite': 'Lax'
-            }])
-            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-            handle_cloudflare(page)
-            page_title = page.title()
-            log(f"📝 当前Title: {page_title}")
-            if "auth/login" not in page.url:
-                log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
-                return True
-            log("❌ Cookie 失效，请更换")
-        except:
-            pass
-
-    # 2. 账号密码登录
-    if not EMAIL or not PASSWORD:
-        return False
-    log("💣 尝试账号密码登录...")
-    try:
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        page.fill('input[name="email"]', EMAIL)
-        page.fill('input[name="password"]', PASSWORD)
-        time.sleep(0.5)
-        handle_cloudflare(page)
-        page.click('button[type="submit"]')
-        time.sleep(3)
-        handle_cloudflare(page)
-        page.wait_for_url(f"{BASE_URL}/*", timeout=30000)
-        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        page_title = page.title()
-        log(f"📝 当前Title: {page_title}")
-        if "auth/login" in page.url:
-            log("❌ 登录失败。")
-            return False
-        log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
-        return True
-    except Exception as e:
-        log(f"❌ 登录异常: {e}")
-        page.screenshot(path="login_fail.png")
-        return False
-
-def get_server_id(page):
-    try:
-        handle_cloudflare(page)
-        time.sleep(3)
-        html = page.content()
-        log(f"📝 页面长度: {len(html)}, URL: {page.url}")
-
-        # 方案1: 从 href 链接中提取 /service/数字/manage
-        matches = re.findall(r'/service/(\d+)/manage', html)
-        if matches:
-            server_id = matches[0]
-            log(f"✅ 从链接中获取到 Server ID: {server_id}")
-            return server_id
-
-        # 方案2: 从 span 标签中提取 #数字 (如 "Free Server #218079")
-        matches = re.findall(r'#(\d{4,})', html)
-        if matches:
-            server_id = matches[0]
-            log(f"✅ 从文本 #号中获取到 Server ID: {server_id}")
-            return server_id
-
-        log("❌ 所有 URL 均未找到 Server ID")
-        return None
-    except Exception as e:
-        log(f"❌ 获取 Server ID 失败: {e}")
-        page.screenshot(path="server_id_error.png")
-        return None
-
-def get_due_date(page):
-    try:
-        if SERVICE_URL not in page.url:
-            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        body_text = page.locator("body").inner_text()
-        patterns = [
-            r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-            r"Due date\s*\n\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-            r"Due date.*?(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, body_text, re.IGNORECASE | re.DOTALL)
-            if match:
-                due_date = match.group(1).strip()
-                log(f"📅 获取到Due Date: {due_date}")
-                return due_date
-    except Exception as e:
-        log(f"❌ 获取Due Date失败: {e}")
-    return "未知"
-
-def dump_modal_text(page):
-    """把页面上疑似弹窗/对话框的文本打到日志，失败时不再盲猜选择器"""
-    try:
-        found = False
-        for sel in ['div[role="dialog"]', '[class*="modal"]', '[class*="Modal"]', '[class*="dialog"]']:
-            loc = page.locator(sel)
-            n = loc.count()
-            for j in range(min(n, 3)):
-                try:
-                    t = (loc.nth(j).inner_text() or "").strip()
-                except Exception:
-                    continue
-                if t:
-                    found = True
-                    log(f"🔍 弹窗候选[{sel}#{j}]: {t[:400]!r}")
-        if not found:
-            log("🔍 页面上没有找到 role=dialog / modal 类弹窗元素")
-    except Exception as e:
-        log(f"🔍 弹窗文本抓取失败: {e}")
-
-
 def renew_service(page):
 
     try:
@@ -292,129 +595,36 @@ def renew_service(page):
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
 
-        # 记录服务页状态：过期/暂停服务器的弹窗流程可能与常规不同
-        try:
-            svc_text = page.locator("body").inner_text()
-            for kw in ["expired", "suspend", "terminat", "overdue"]:
-                if kw in svc_text.lower():
-                    log(f"⚠️ 服务页面出现状态词 '{kw}'，本次可能是过期/暂停服务器的续期流程，弹窗可能与常规不同")
-                    break
-        except Exception:
-            pass
-
-        log("🖱️ 准备点击 'Renew' 按钮...")
+        log("🖱️ 准备点击 Renew 按钮...")
+        time.sleep(3)
         renew_btn = page.locator('button:has-text("Renew")')
         create_btn = page.locator('button:has-text("Create Invoice")')
 
         modal_opened = False
-
-        # 先诊断 Renew 按钮和 modal 元素状态
-        try:
-            btn_html = renew_btn.evaluate("el => el.outerHTML.slice(0, 500)")
-            is_disabled = renew_btn.evaluate("el => el.disabled")
-            is_visible = renew_btn.is_visible()
-            is_enabled = renew_btn.is_enabled()
-            log(f"🔍 Renew 按钮状态: visible={is_visible} enabled={is_enabled} disabled={is_disabled}")
-            log(f"🔍 Renew 按钮 HTML: {btn_html!r}")
-            # 检查 modal 元素是否存在
-            modal_exists = page.evaluate("() => !!document.getElementById('renewService-221355')")
-            log(f"🔍 modal #renewService-221355 存在: {modal_exists}")
-            if modal_exists:
-                modal_html = page.evaluate("() => document.getElementById('renewService-221355').outerHTML.slice(0, 800)")
-                modal_visible = page.evaluate("() => { const m = document.getElementById('renewService-221355'); const s = window.getComputedStyle(m); return s.display !== 'none' && s.visibility !== 'hidden'; }")
-                log(f"🔍 modal 可见: {modal_visible}")
-                log(f"🔍 modal HTML: {modal_html!r}")
-            # 检查 Flowbite 是否加载
-            flowbite_loaded = page.evaluate("() => typeof window.Flowbite !== 'undefined' || typeof window.Modal !== 'undefined'")
-            log(f"🔍 Flowbite/Modal JS 已加载: {flowbite_loaded}")
-        except Exception as e:
-            log(f"🔍 诊断失败: {e}")
-
-        # 直接用 JS 打开 modal，绕过按钮点击（按钮点击在 headless 下可能不触发 Flowbite）
-        try:
-            opened = page.evaluate("""() => {
-                const m = document.getElementById('renewService-221355');
-                if (!m) return 'no-element';
-                try {
-                    // 尝试 Flowbite Modal API
-                    if (typeof Modal !== 'undefined') {
-                        const modal = new Modal(m);
-                        modal.show();
-                        return 'flowbite-api';
-                    }
-                } catch(e) {}
-                // 兜底：手动去掉 hidden
-                m.classList.remove('hidden');
-                m.removeAttribute('aria-hidden');
-                m.style.display = 'block';
-                // 触发 Flowbite 的 backdrop
-                document.body.classList.add('overflow-hidden');
-                return 'manual-unhide';
-            }""")
-            log(f"🔍 直接打开 modal 结果: {opened}")
-            time.sleep(2)
-            # 检查 Create Invoice 是否可见
-            try:
-                create_btn.wait_for(state="visible", timeout=10000)
-                log("✅ 直接打开 modal 成功（Create Invoice 可见）")
-                modal_opened = True
-                dump_modal_text(page)
-            except Exception:
-                log("⚠️ 直接打开后 Create Invoice 仍不可见，回落到按钮点击")
-        except Exception as e:
-            log(f"🔍 直接打开 modal 失败: {e}，回落到按钮点击")
-
-        for i in range(3):
-
-            # 若弹窗其实已经打开（上一轮点击生效但检测漏了），直接用，不重复点
-            try:
-                if create_btn.is_visible():
-                    log("✅ 检测到 Create Invoice 已可见，弹窗其实已打开")
-                    modal_opened = True
-                    break
-            except Exception:
-                pass
-
+        for i in range(6):
             try:
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                if i == 0:
-                    renew_btn.click()
-                    log("🖱️ 使用 Playwright 普通点击")
-                elif i == 1:
-                    # 第二次：JS 直接触发 click，绕过 actionability 检查
-                    renew_btn.evaluate("el => el.click()")
-                    log("🖱️ 使用 JavaScript 直接点击")
-                else:
-                    # 第三次：force 点击 + 分发鼠标事件
-                    renew_btn.click(force=True)
-                    log("🖱️ 使用 force 点击")
+                renew_btn.click()
 
-                # 等待一小段时间，检测是否出现"未到续期时间"弹窗
-                time.sleep(2)
+                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
+                time.sleep(3)
                 page_text = page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
                     log("⚠️ 未到续期时间，无法续期。")
                     page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"  # 特殊状态
+                    return "NOT_TIME"   # 特殊状态
 
-                handle_cloudflare(page)
-                log("🖲️ 等待续期弹窗出现...")
-
+                log("🖲️ 等待弹窗出现...")
                 try:
-                    # 不再硬编码弹窗标题（如 "Renew Plan"）：Create Invoice 按钮可见即判定弹窗已开。
-                    # 标题文字一旦改版，旧写法会空等 30 秒×3 次然后失败（2026-10-10 run #15 就是这么挂的）。
-                    create_btn.wait_for(state="visible", timeout=30000)
+                    create_btn.wait_for(state="visible", timeout=8000)
                     modal_opened = True
-                    log("✅ 续期弹窗已出现（Create Invoice 可见）")
-                    dump_modal_text(page)
+                    log("✅ 弹窗已成功弹出！")
                     break
-                except Exception:
-                    log("⚠️ 弹窗未出现（Create Invoice 不可见），把当前页面弹窗文本打到日志后重试...")
-                    dump_modal_text(page)
+                except:
+                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
                     time.sleep(2)
-
             except Exception as e:
                 log(f"❌ 点击尝试出错: {e}")
 
@@ -423,185 +633,60 @@ def renew_service(page):
             page.screenshot(path="renew_modal_failed.png")
             return False
 
-        # modal 已打开，先处理其中的 Turnstile 验证，再点 Create Invoice
-        # （2026-10-10 run #19 教训：不先过验证直接点，会报 cf-turnstile-response required）
-        # （2026-10-11 教训：被动等 30 秒不够，Turnstile iframe 需要主动触发）
-        log("🛡️ 处理 modal 中的 Turnstile 验证...")
-        handle_cloudflare(page)
+        # 弹窗内先完成 Turnstile 人机验证，再提交
+        handle_cloudflare(page, timeout=60)
+        if not solve_modal_turnstile(page, timeout=90):
+            log("⚠️ Turnstile 未确认通过，仍将尝试提交...")
+            page.screenshot(path="turnstile_timeout.png")
 
-        # 主动查找并触发 modal 内的 Turnstile widget
-        try:
-            turnstile_info = page.evaluate("""() => {
-                const result = { iframes: 0, widgets: 0, token_present: false, token_len: 0 };
-                // 查找所有 Turnstile 相关 iframe
-                const iframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
-                result.iframes = iframes.length;
-                // 查找 Turnstile widget 容器
-                const widgets = document.querySelectorAll('.cf-turnstile');
-                result.widgets = widgets.length;
-                // 检查 token 字段
-                const el = document.querySelector('[name="cf-turnstile-response"]');
-                if (el) {
-                    result.token_present = true;
-                    result.token_len = (el.value || '').length;
-                }
-                return result;
-            }""")
-            log(f"🔍 Turnstile 状态: iframes={turnstile_info['iframes']}, widgets={turnstile_info['widgets']}, token_present={turnstile_info['token_present']}, token_len={turnstile_info['token_len']}")
-        except Exception as e:
-            log(f"🔍 Turnstile 状态检查失败: {e}")
-
-        # 如果 widget div 存在但 iframe 没加载，尝试手动渲染 Turnstile
-        try:
-            need_render = page.evaluate("""() => {
-                const widgets = document.querySelectorAll('.cf-turnstile');
-                const iframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
-                return { widgets: widgets.length, iframes: iframes.length,
-                         turnstile_loaded: typeof window.turnstile !== 'undefined' };
-            }""")
-            log(f"🔍 Turnstile 渲染检查: widgets={need_render['widgets']}, iframes={need_render['iframes']}, turnstile.js已加载={need_render['turnstile_loaded']}")
-            if need_render['widgets'] > 0 and need_render['iframes'] == 0:
-                if need_render['turnstile_loaded']:
-                    log("🔄 widget 未渲染，尝试手动调用 turnstile.render()...")
-                    render_result = page.evaluate("""() => {
-                        const out = [];
-                        document.querySelectorAll('.cf-turnstile').forEach((el, idx) => {
-                            const info = {
-                                idx: idx,
-                                sitekey: el.getAttribute('data-sitekey') || '(无)',
-                                action: el.getAttribute('data-action') || '(无)',
-                                theme: el.getAttribute('data-theme') || '(无)',
-                                size: el.getAttribute('data-size') || '(无)',
-                                callback: el.getAttribute('data-callback') || '(无)',
-                                hasWidgetId: !!el.dataset.widgetId,
-                                outerHTML_slice: el.outerHTML.slice(0, 300)
-                            };
-                            try {
-                                if (!el.dataset.tsRendered) {
-                                    const wid = window.turnstile.render(el);
-                                    el.dataset.tsRendered = '1';
-                                    info.renderResult = 'OK, widgetId=' + wid;
-                                } else {
-                                    info.renderResult = '已渲染过，跳过';
-                                }
-                            } catch(e) {
-                                info.renderResult = 'ERROR: ' + (e.message || e);
-                            }
-                            out.push(info);
-                        });
-                        return out;
-                    }""")
-                    for r in render_result:
-                        log(f"🔍 widget[{r['idx']}]: sitekey={r['sitekey'][:20]}..., render={r['renderResult']}")
-                        if r['sitekey'] == '(无)':
-                            log(f"🔍 widget HTML: {r['outerHTML_slice']!r}")
-                    time.sleep(5)
-                    # 重新检查 iframe
-                    recheck = page.evaluate("""() => document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]').length""")
-                    log(f"🔍 手动渲染后 iframe 数量: {recheck}")
-                else:
-                    log("⚠️ turnstile.js 未加载，widget 无法渲染（可能是脚本被拦截）")
-        except Exception as e:
-            log(f"⚠️ Turnstile 手动渲染失败: {e}")
-
-        # 如果有可见的 checkbox，主动点击
-        try:
-            ts_iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
-            if page.locator(ts_iframe_selector).count() > 0:
-                log("🖱️ 发现 Turnstile iframe，尝试主动触发...")
-                for attempt in range(3):
-                    try:
-                        frame = page.frame_locator(ts_iframe_selector).first
-                        # 尝试点击 checkbox 或整个 widget
-                        checkbox = frame.locator('input[type="checkbox"]')
-                        if checkbox.count() > 0 and checkbox.first.is_visible():
-                            log(f"🖱️ 第 {attempt+1} 次点击 Turnstile checkbox...")
-                            checkbox.first.click()
-                            time.sleep(3)
-                        else:
-                            # 尝试点击 iframe body（适用于 invisible 模式）
-                            log(f"🖱️ 第 {attempt+1} 次尝试点击 Turnstile 区域...")
-                            page.locator(ts_iframe_selector).first.click()
-                            time.sleep(3)
-                    except Exception as e:
-                        log(f"⚠️ Turnstile 点击尝试 {attempt+1} 失败: {e}")
-                        time.sleep(2)
-        except Exception as e:
-            log(f"⚠️ Turnstile 主动触发失败: {e}")
-
-        # 等待 Turnstile token 生成（cf-turnstile-response 隐藏字段有值）
-        try:
-            page.wait_for_function(
-                "() => { const el = document.querySelector('[name=cf-turnstile-response]'); return el && el.value && el.value.length > 10; }",
-                timeout=45000
-            )
-            log("✅ Turnstile token 已生成")
-        except Exception:
-            # 最后检查一次 token 状态
-            try:
-                final_check = page.evaluate("""() => {
-                    const el = document.querySelector('[name="cf-turnstile-response"]');
-                    return el ? (el.value || '').length : -1;
-                }""")
-                log(f"⚠️ Turnstile token 未检测到 (最终检查 token 长度: {final_check})，继续尝试点击（可能验证已自动通过）")
-            except Exception:
-                log("⚠️ Turnstile token 未检测到，继续尝试点击（可能验证已自动通过）")
-
-        log("🖱️ 点击 'Create Invoice'...")
-        # 点击前先关横幅（#41 的横幅拦截就是死在这里）
-        dismiss_ncmp_banner(page)
-        try:
-            create_btn.scroll_into_view_if_needed(timeout=5000)
-            create_btn.click(timeout=10000)
-            log("🖱️ Playwright 点击已执行")
-        except Exception as e:
-            log(f"⚠️ Playwright 点击失败（可能仍被横幅拦截），关横幅后改用 force/JS 点击: {e}")
+        # 点击 Create Invoice；未跳转说明验证未通过/已过期，重做验证后再试
+        time.sleep(3)
+        new_invoice_url = None
+        for attempt in range(6):
+            log(f"🖱️ 点击 'Create Invoice'（第 {attempt + 1} 次）...")
+            # #41 实测：ncmp Cookie 横幅会拦截指针事件导致点击 20s 超时，先关横幅
             dismiss_ncmp_banner(page)
             try:
-                create_btn.click(timeout=10000, force=True)
-                log("🖱️ force 点击已执行")
-            except Exception:
-                create_btn.evaluate("el => el.click()")
-                log("🖱️ JS 点击已执行")
-
-        # 点击后短暂等待，检查是否有验证错误信息
-        time.sleep(3)
-        try:
-            page_text = page.locator("body").inner_text()
-            if "cf-turnstile-response" in page_text.lower() or "field is required" in page_text.lower():
-                log("❌ 检测到 Turnstile 验证错误：cf-turnstile-response field is required")
-                page.screenshot(path="turnstile_error.png")
-                # 尝试重新触发 Turnstile 再点一次
-                log("🔄 尝试重新处理 Turnstile 后再次点击...")
-                handle_cloudflare(page)
-                time.sleep(5)
+                create_btn.wait_for(state="visible", timeout=20000)
+                create_btn.click(timeout=20000)
+            except Exception as e:
+                log(f"⚠️ 点击 Create Invoice 失败: {e}")
+                # 横幅可能仍在拦截：再关一次，改 force/JS 点击兜底
+                dismiss_ncmp_banner(page)
                 try:
-                    create_btn.evaluate("el => el.click()")
-                    log("🖱️ 已重新点击 Create Invoice")
-                except Exception as e2:
-                    log(f"⚠️ 重新点击失败: {e2}")
-        except Exception:
-            pass
+                    create_btn.click(timeout=10000, force=True)
+                    log("🖱️ force 点击已执行")
+                except Exception:
+                    try:
+                        create_btn.evaluate("el => el.click()")
+                        log("🖱️ JS 点击已执行")
+                    except Exception as e2:
+                        log(f"⚠️ force/JS 点击也失败: {e2}")
+                        solve_modal_turnstile(page, timeout=45)
+                        continue
 
-        # 点击后诊断：#42 的表现是点击后无跳转、按钮随后不可见，
-        # 先把 URL 和 modal 状态打到日志，方便区分"横幅拦截"与"弹窗关闭"两种失败
-        try:
-            _modal_exists = page.evaluate("() => !!document.getElementById('renewService-221355')")
-            log(f"🔍 点击后状态: url={page.url!r}, CreateInvoice可见={create_btn.is_visible()}, modal存在={_modal_exists}")
-        except Exception as _e:
-            log(f"🔍 点击后状态检查失败: {_e}")
+            # 点击后诊断：记录 URL 与按钮可见性，区分"横幅拦截"与"弹窗关闭"两种失败
+            try:
+                log(f"🔍 点击后状态: url={page.url!r}, CreateInvoice可见={create_btn.is_visible()}")
+            except Exception:
+                pass
 
-        new_invoice_url = None
-        start_wait = time.time()
-        while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url:
-                new_invoice_url = page.url
-                log(f"🎉 页面已跳转: {new_invoice_url}")
+            start_wait = time.time()
+            while time.time() - start_wait < 30:
+                if "/payment/invoice/" in page.url:
+                    new_invoice_url = page.url
+                    log(f"🎉 页面已跳转: {new_invoice_url}")
+                    break
+                # 出现整页 Cloudflare 拦截/安全验证页时先处理（弹窗内的 Turnstile 组件交给 solve_modal_turnstile）
+                if _has_interstitial_iframe(page) or _is_security_check_page(page):
+                    log("⚠️ 遇到整页拦截，尝试处理...")
+                    handle_cloudflare(page, timeout=60)
+                time.sleep(1)
+            if new_invoice_url:
                 break
-            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-                log("⚠️ 遇到拦截，尝试处理...")
-                handle_cloudflare(page)
-            time.sleep(1)
+
+            log("⚠️ 未跳转到发票页面，尝试重新完成 Turnstile 验证后重试...")
+            solve_modal_turnstile(page, timeout=45)
 
         if not new_invoice_url:
             log("❌ 未能进入发票页面，超时。")
@@ -612,15 +697,14 @@ def renew_service(page):
             page.goto(new_invoice_url)
         handle_cloudflare(page)
 
-        log("🔎 查找 'Pay' 按钮...")
+        log("🔎 查找 Pay 按钮...")
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
         pay_btn.click()
-        log("✅ 'Pay' 按钮已点击。")
+        log("✅ Pay 按钮已点击")
 
         # 等待支付确认页面或跳转回服务页
         time.sleep(5)
-
         # 返回服务管理页面以获取新的到期时间
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
@@ -630,8 +714,11 @@ def renew_service(page):
         log(f"❌ 续费异常: {e}")
         page.screenshot(path="renew_error.png")
         return False
+
 def main():
     # 检查必要环境变量
+    log(f"🔍 凭证检测: COOKIE_VALUE={'已配置' if COOKIE_VALUE else '未配置'}, "
+        f"EMAIL={'已配置' if EMAIL else '未配置'}, PASSWORD={'已配置' if PASSWORD else '未配置'}")
     if not COOKIE_VALUE and not (EMAIL and PASSWORD):
         log("❌ 缺少登录凭证")
         sys.exit(1)
@@ -639,6 +726,7 @@ def main():
     global SERVICE_URL
 
     with sync_playwright() as p:
+        browser = None
         try:
             if IS_PROXY:
                 log(f"⚙️ 代理已启用: {PROXY_SERVER}")
@@ -649,19 +737,8 @@ def main():
             current_ip = get_current_ip(PROXY_SERVER)
             log(f"🎯 当前出口IP: {current_ip}")
 
-            log("🚀 启动浏览器...")
-            browser = p.chromium.launch(
-                channel="chrome",
-                headless=False,
-                args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
-            )
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                proxy={"server": PROXY_SERVER} if IS_PROXY else None
-            )
-            page = context.new_page()
-            page.add_init_script(STEALTH_JS)
+            log("🚀 启动反检测内核浏览器...") # 使用patchright 反检测内核
+            browser, page = open_browser(p)
 
             if not login(page):
                 sys.exit(1)
@@ -693,7 +770,7 @@ def main():
                 status = "✅ 续期成功"
 
             # 发送 Telegram 通知
-            send_telegram_notification(status, old_due, new_due)
+            send_telegram_notification(status, old_due, new_due, current_ip)
 
             if renew_result == "NOT_TIME":
                 sys.exit(0)
@@ -705,8 +782,11 @@ def main():
             log(f"❌ 浏览器启动出错: {e}")
             sys.exit(1)
         finally:
-            if 'browser' in locals() and browser:
-                browser.close()
+            if browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
                 
 if __name__ == "__main__":
     main()
