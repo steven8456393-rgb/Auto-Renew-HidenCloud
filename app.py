@@ -2,7 +2,10 @@
 # -*- coding: utf-8 -*-
 
 import os,re,sys,time,random,requests
-from playwright.sync_api import sync_playwright
+try:
+    from patchright.sync_api import sync_playwright
+except ImportError:
+    from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
 COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # remember_web cookie 值，必填
