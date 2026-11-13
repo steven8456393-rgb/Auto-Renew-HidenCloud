@@ -587,7 +587,7 @@ def dismiss_ncmp_banner(page):
         log(f"⚠️ 关闭 ncmp 横幅失败（继续尝试点击）: {e}")
         return False
 
-def renew_service(page):
+def renew_service(page, _depth=0):
 
     try:
         log("➡ 进入续期流程...")
@@ -677,6 +677,17 @@ def renew_service(page):
                     new_invoice_url = page.url
                     log(f"🎉 页面已跳转: {new_invoice_url}")
                     break
+                # 2026-11-12 实测：点 Create Invoice 后会话失效被踢回登录页，
+                # 此时按钮不存在，继续重试 Turnstile 是空转。检测到就重新登录并完整重试一次。
+                if "/auth/login" in page.url:
+                    log("⚠️ 会话失效被跳回登录页，重新登录后重试续期...")
+                    if _depth >= 1:
+                        log("❌ 已重新登录重试过一次，仍被踢回登录页，放弃。")
+                        return False
+                    if login(page):
+                        return renew_service(page, _depth + 1)
+                    log("❌ 重新登录失败")
+                    return False
                 # 出现整页 Cloudflare 拦截/安全验证页时先处理（弹窗内的 Turnstile 组件交给 solve_modal_turnstile）
                 if _has_interstitial_iframe(page) or _is_security_check_page(page):
                     log("⚠️ 遇到整页拦截，尝试处理...")
